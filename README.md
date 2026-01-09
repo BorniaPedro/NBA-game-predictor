@@ -1,1 +1,1 @@
-# baseball-ML
+# NBA-game-predictor

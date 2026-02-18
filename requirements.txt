@@ -1,0 +1,7 @@
+streamlit
+pandas
+joblib
+nba_api
+streamlit-extras
+xgboost
+pyarrow

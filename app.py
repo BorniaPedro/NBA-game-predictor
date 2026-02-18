@@ -304,7 +304,7 @@ with stylable_container(
     if st.button("Make Predictions", type="primary", icon=":material/wand_stars:"):
         with st.spinner(f"Finding games for {target_date.strftime('%d/%m/%Y')}..."):
             
-            # 1. API Call
+            # API Call
             date_str = target_date.strftime('%Y-%m-%d')
             try:
                 board = scoreboardv2.ScoreboardV2(game_date=date_str, day_offset=0)
@@ -317,6 +317,14 @@ with stylable_container(
             if df_games.empty:
                 st.warning("No games found for this date.")
             else:
+                df_games = df_games.drop_duplicates(subset=['GAME_ID'])
+
+                # Order by time
+                if 'GAME_SEQUENCE' in df_games.columns:
+                    df_games = df_games.sort_values(by='GAME_SEQUENCE')
+
+                line_score = line_score.drop_duplicates(subset=['GAME_ID', 'TEAM_ID'])
+
                 # Merge to get team abbreviations
                 df_games = pd.merge(df_games, line_score[['GAME_ID', 'TEAM_ID', 'TEAM_ABBREVIATION']], 
                                     left_on=['GAME_ID', 'HOME_TEAM_ID'], right_on=['GAME_ID', 'TEAM_ID'], how='left')
@@ -375,7 +383,7 @@ with stylable_container(
                     with h1:
                         st.markdown("<div style='text-align: center; color: #888; font-weight: bold; font-size: 15px; letter-spacing: 1px;'>VISITOR TEAM</div>", unsafe_allow_html=True)
                     with h2:
-                        st.markdown("<div style='text-align: center; color: #888; font-weight: bold; font-size: 15px; letter-spacing: 1px;'>WIN PROBABILITY</div>", unsafe_allow_html=True)
+                        st.markdown("<div style='text-align: center; color: #888; font-weight: bold; font-size: 15px; letter-spacing: 1px;'>TIME & WIN PROBABILITY</div>", unsafe_allow_html=True)
                     with h3:
                         st.markdown("<div style='text-align: center; color: #888; font-weight: bold; font-size: 15px; letter-spacing: 1px;'>HOME TEAM</div>", unsafe_allow_html=True)
                     with h4:
@@ -389,6 +397,7 @@ with stylable_container(
                         orig_row = df_games.loc[valid_indices[i]]
                         home = orig_row['HOME_TEAM_ABBREVIATION']
                         away = orig_row['AWAY_TEAM_ABBREVIATION']
+                        game_time = orig_row['GAME_STATUS_TEXT']
                         
                         prob_away = 1 - prob_home
                         winner = home if prob_home > 0.5 else away
@@ -414,9 +423,10 @@ with stylable_container(
                             with c1:
                                 st.markdown(get_team_card(away, "Visitor", align="center"), unsafe_allow_html=True)
                             with c2:
-                                st.markdown('<div style="margin-top: 5px;">', unsafe_allow_html=True) 
+                                st.markdown(f"<div style='text-align: center; font-weight: bold; color: #444; margin-bottom: 5px; background: #e0e0e0; border-radius: 4px; display: inline-block; padding: 2px 10px; font-size: 12px;'>{game_time}</div>", unsafe_allow_html=True)
+                                st.markdown(f"<div style='text-align: center; width: 100%;'>", unsafe_allow_html=True)
                                 st.progress(float(prob_away))
-                                st.markdown(f"</div><div style='text-align: center; color: #ccc; font-size: 14px; margin-top: 2px;'>{prob_away:.1%} vs {prob_home:.1%}</div>", unsafe_allow_html=True)
+                                st.markdown(f"</div><div style='text-align: center; color: #888; font-size: 13px;'>{prob_away:.1%} vs {prob_home:.1%}</div>", unsafe_allow_html=True)
                             with c3:
                                 st.markdown(get_team_card(home, "Home", align="center"), unsafe_allow_html=True)
                             with c4:

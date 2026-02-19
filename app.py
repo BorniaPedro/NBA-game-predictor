@@ -423,7 +423,7 @@ with stylable_container(
                             with c1:
                                 st.markdown(get_team_card(away, "Visitor", align="center"), unsafe_allow_html=True)
                             with c2:
-                                st.markdown(f"<div style='text-align: center; font-weight: bold; color: #444; margin-bottom: 5px; background: #e0e0e0; border-radius: 4px; display: inline-block; padding: 2px 10px; font-size: 12px;'>{game_time}</div>", unsafe_allow_html=True)
+                                st.markdown(f"<div style='text-align: center; width: 100%; margin-bottom: 5px;'><span style='font-weight: bold; color: #white; background: #262730; border-radius: 4px; padding: 2px 10px; font-size: 12px;'>{game_time}</span></div>", unsafe_allow_html=True)
                                 st.markdown(f"<div style='text-align: center; width: 100%;'>", unsafe_allow_html=True)
                                 st.progress(float(prob_away))
                                 st.markdown(f"</div><div style='text-align: center; color: #888; font-size: 13px;'>{prob_away:.1%} vs {prob_home:.1%}</div>", unsafe_allow_html=True)

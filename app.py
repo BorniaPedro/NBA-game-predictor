@@ -1,8 +1,12 @@
 import streamlit as st
 import pandas as pd
 import joblib
+import requests
+import unicodedata
+import re
+import time
 from datetime import datetime, timedelta
-from nba_api.stats.endpoints import scoreboardv2
+from nba_api.stats.endpoints import scoreboardv3
 from streamlit_extras.stylable_container import stylable_container
 
 # --- Configs ---
@@ -25,7 +29,6 @@ st.markdown("""
         gap: 0.2rem !important;
     }
     
-    /* Estilo dos cards */
     .metric-card {
         background-color: #f0f2f6;
         border-radius: 10px;
@@ -41,15 +44,17 @@ def load_assets():
     try:
         model = joblib.load('xgb model/nba_model_xgb.pkl')
         features = joblib.load('./xgb model/feature_list.pkl')
-            
         history = pd.read_parquet('./dataframes/nba_games_history.parquet')
         history['GAME_DATE'] = pd.to_datetime(history['GAME_DATE'])
-        return model, features, history
+
+        df_impact = pd.read_parquet('./dataframes/player_impact_current.parquet')
+
+        return model, features, history, df_impact
     except Exception as e:
         st.error(f"ERROR loading the assets: {e}")
         st.stop()
 
-xgb_model, features_xgb, df_history = load_assets()
+xgb_model, features_xgb, df_history, df_player_impact = load_assets()
 
 # --- Preping ID and Matchups ---
 @st.cache_data
@@ -75,8 +80,8 @@ def get_current_state(df):
     elo_dict = {}
     team_histories = {}
     last_season_dict = {}
-    k_factor = 40
-    retention = 0.75
+    k_factor = 45
+    retention = 0.65
 
     for _, row in df.iterrows():
         h_id, a_id = row['HOME_TEAM_ID'], row['AWAY_TEAM_ID']
@@ -123,14 +128,136 @@ def get_last_team_game(df, team_id, game_date):
     side = 'home' if last_game['HOME_TEAM_ID'] == team_id else 'away'
     return last_game, side
 
-def build_feature_row(up_row, df_hist):
+ESPN_TO_NBA_TEAMS = {
+    "GS": "GSW", "NY": "NYK", "SA": "SAS", "UTAH": "UTA",
+    "WSH": "WAS", "NO": "NOP", "PHO": "PHX", "BK": "BKN"
+}
+
+def clean_player_name(name):
+    """Clean player names to match the format in the impact dataframe"""
+    if not isinstance(name, str):
+        return ""
+    name = unicodedata.normalize('NFKD', name).encode('ASCII', 'ignore').decode('utf-8')
+    name = re.sub(r'[^a-zA-Z0-9\s]', '', name)
+    name = re.sub(r'\b(jr|sr|ii|iii|iv)\b', '', name, flags=re.IGNORECASE)
+    return " ".join(name.lower().split())
+
+TEAM_NAME_TO_ABBR = {
+    'Atlanta Hawks': 'ATL', 'Boston Celtics': 'BOS', 'Brooklyn Nets': 'BKN',
+    'Charlotte Hornets': 'CHA', 'Chicago Bulls': 'CHI', 'Cleveland Cavaliers': 'CLE',
+    'Dallas Mavericks': 'DAL', 'Denver Nuggets': 'DEN', 'Detroit Pistons': 'DET',
+    'Golden State Warriors': 'GSW', 'Houston Rockets': 'HOU', 'Indiana Pacers': 'IND',
+    'LA Clippers': 'LAC', 'Los Angeles Clippers': 'LAC', 'Los Angeles Lakers': 'LAL',
+    'Memphis Grizzlies': 'MEM', 'Miami Heat': 'MIA', 'Milwaukee Bucks': 'MIL',
+    'Minnesota Timberwolves': 'MIN', 'New Orleans Pelicans': 'NOP', 'New York Knicks': 'NYK',
+    'Oklahoma City Thunder': 'OKC', 'Orlando Magic': 'ORL', 'Philadelphia 76ers': 'PHI',
+    'Phoenix Suns': 'PHX', 'Portland Trail Blazers': 'POR', 'Sacramento Kings': 'SAC',
+    'San Antonio Spurs': 'SAS', 'Toronto Raptors': 'TOR', 'Utah Jazz': 'UTA',
+    'Washington Wizards': 'WAS'
+}
+
+@st.cache_data(ttl=600)
+def get_nba_injuries_espn(target_date_str=None):
+    """Fetch NBA injuries from ESPN API and return a dictionary of team injuries with player impact"""
+    url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code != 200:
+            return {}
+        data = res.json()
+    except Exception:
+        return {}
+
+    team_injuries = {}
+    status_weights = {
+        "OUT": 1.0,
+        "DOUBTFUL": 0.75,
+        "QUESTIONABLE": 0.50,
+        "DAY-TO-DAY": 0.40,
+        "PROBABLE": 0.15
+    }
+
+    # Iterate through teams and injuries
+    for team_data in data.get("injuries", []):
+        display_name = team_data.get("displayName", "")
+        raw_abbr = team_data.get("abbreviation", "")
+        
+        team_abbr = TEAM_NAME_TO_ABBR.get(display_name) or ESPN_TO_NBA_TEAMS.get(raw_abbr.upper(), raw_abbr.upper())
+        if not team_abbr:
+            continue
+
+        injuries_list = team_data.get("injuries", [])
+        for inj in injuries_list:
+            athlete_name = inj.get("athlete", {}).get("displayName")
+            status_desc = inj.get("status", "").upper()
+            
+            p_out = 0.0
+            for key, val in status_weights.items():
+                if key in status_desc:
+                    p_out = val
+                    break
+            if p_out == 0.0 and "OUT" in status_desc:
+                p_out = 1.0
+
+            if p_out > 0.0 and athlete_name:
+                if team_abbr not in team_injuries:
+                    team_injuries[team_abbr] = []
+                    
+                team_injuries[team_abbr].append({
+                    "name": athlete_name,
+                    "clean_name": clean_player_name(athlete_name),
+                    "status": status_desc,
+                    "p_out": p_out,
+                    "detail": inj.get("details", {}).get("type", "")
+                })
+
+    return team_injuries
+
+def calculate_team_injury_penalty(team_abbr, injuries_dict, df_impact, replacement_gmsc=5.0, elo_multiplier=9.2):
+    """Calculate the total injury penalty on ELO for a team based on injured players' impact"""
+    injuries = injuries_dict.get(team_abbr, [])
+    if not injuries:
+        return 0.0, []
+
+    impact_lookup = {
+        clean_player_name(row['PLAYER_NAME']): row['CURRENT_EWMA_GMSC']
+        for _, row in df_impact.iterrows()
+    }
+
+    total_penalty = 0.0
+    impacted_players = []
+
+    for inj in injuries:
+        clean_name = inj['clean_name']
+        p_out = inj['p_out']
+        player_gmsc = impact_lookup.get(clean_name, None)
+
+        if player_gmsc is not None:
+            marginal_gmsc = player_gmsc - replacement_gmsc
+            if marginal_gmsc > 0:
+                deduction = p_out * marginal_gmsc * elo_multiplier
+                total_penalty += deduction
+                impacted_players.append({
+                    "name": inj['name'],
+                    "status": inj['status'],
+                    "gmsc": player_gmsc,
+                    "deduction": deduction
+                })
+
+    # Max penalty cap to avoid extreme ELO drops
+    return min(total_penalty, 210.0), impacted_players
+
+def build_feature_row(up_row, df_hist, current_elos, team_elo_histories, injuries_dict, df_impact):
     h_id, a_id = up_row['HOME_TEAM_ID'], up_row['AWAY_TEAM_ID']
+    h_abbr = up_row['HOME_TEAM_ABBREVIATION']
+    a_abbr = up_row['AWAY_TEAM_ABBREVIATION']
     date = up_row['GAME_DATE']
 
     last_h, side_h = get_last_team_game(df_hist, h_id, date)
     last_a, side_a = get_last_team_game(df_hist, a_id, date)
-
-    if last_h is None or last_a is None: return None
+    if last_h is None or last_a is None: 
+        return None, None
 
     # Helper to get stats
     def get_stat(game, side, col):
@@ -144,19 +271,26 @@ def build_feature_row(up_row, df_hist):
     b2b_a = 1 if rest_a <= 1 else 0
 
     # ELO & Momentum
-    elo_h = current_elos.get(h_id, 1500)
-    elo_a = current_elos.get(a_id, 1500)
+    base_elo_h = current_elos.get(h_id, 1500)
+    base_elo_a = current_elos.get(a_id, 1500)
+
+    # Calculate penalty based on injuries
+    penalty_h, players_h = calculate_team_injury_penalty(h_abbr, injuries_dict, df_impact)
+    penalty_a, players_a = calculate_team_injury_penalty(a_abbr, injuries_dict, df_impact)
+
+    adj_elo_h = base_elo_h - penalty_h
+    adj_elo_a = base_elo_a - penalty_a
     
     def get_mom(tid, curr):
         hist = team_elo_histories.get(tid, [])
         return (curr - hist[-5]) if len(hist) >= 5 else 0
     
-    mom_h = get_mom(h_id, elo_h)
-    mom_a = get_mom(a_id, elo_a)
+    mom_h = get_mom(h_id, adj_elo_h)
+    mom_a = get_mom(a_id, adj_elo_a)
 
     # --- MATCHUP ENCODING ---
-    matchup_str = up_row['HOME_TEAM_ABBREVIATION'] + ' vs. ' + up_row['AWAY_TEAM_ABBREVIATION']
-    matchup_id = matchup_map.get(matchup_str, -1) 
+    matchup_str = h_abbr + ' vs. ' + a_abbr
+    matchup_id = matchup_map.get(matchup_str, -1)
 
     # Dictionary
     row = {
@@ -170,9 +304,9 @@ def build_feature_row(up_row, df_hist):
         'HOME_IS_B2B': b2b_h,
         'AWAY_IS_B2B': b2b_a,
         'REST_DIFF': rest_h - rest_a,
-        'HOME_ELO': elo_h,
-        'AWAY_ELO': elo_a,
-        'ELO_DIFF': elo_h - elo_a,
+        'HOME_ELO': adj_elo_h,
+        'AWAY_ELO': adj_elo_a,
+        'ELO_DIFF': adj_elo_h - adj_elo_a,
         'HOME_ELO_MOMENTUM': mom_h,
         'AWAY_ELO_MOMENTUM': mom_a,
         'MOMENTUM_DIFF': mom_h - mom_a
@@ -192,7 +326,13 @@ def build_feature_row(up_row, df_hist):
     row['HOME_GAME_COUNT'] += 1
     row['AWAY_GAME_COUNT'] += 1
 
-    return row
+    injury_meta = {
+        'home_penalty': penalty_h,
+        'away_penalty': penalty_a,
+        'home_players': players_h,
+        'away_players': players_a
+    }
+    return row, injury_meta
 
 # Team color mapping (for visualization)
 nba_team_colors = {
@@ -266,6 +406,36 @@ def get_team_card(team_name, role, align="center"):
     </div>
     """
 
+def get_injury_badge_html(penalty, impacted_players):
+    """
+    Return HTML with ELO deduction and list of impacted players
+    If no impacted players, return an empty string
+    """
+    if penalty <= 0 or not impacted_players:
+        return ""
+
+    sorted_players = sorted(impacted_players, key=lambda x: x['deduction'], reverse=True)
+
+    top_players = sorted_players[:2]
+    players_text_list = [f"{p['name']} ({p['status']})" for p in top_players]
+
+    extra_count = len(sorted_players) - len(top_players)
+    if extra_count > 0:
+        players_text_list.append(f"+{extra_count} more")
+
+    players_summary = "<br>".join(players_text_list)
+
+    return f"""
+    <div style="text-align: center; margin-top: 6px;">
+        <span style="background-color: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 6px; padding: 2px 8px; font-size: 11px; font-weight: bold; letter-spacing: 0.5px;">
+            ⚠️ Injuries
+        </span>
+        <div style="font-size: 11px; color: #9ca3af; margin-top: 4px; line-height: 1.2; max-width: 180px; margin-left: auto; margin-right: auto;" title="{players_summary}">
+            {players_summary}
+        </div>
+    </div>
+    """
+
 # --- Dashboard logic ---
 
 # Sidebar
@@ -303,62 +473,74 @@ with stylable_container(
 ):
     if st.button("Make Predictions", type="primary", icon=":material/wand_stars:"):
         with st.spinner(f"Finding games for {target_date.strftime('%d/%m/%Y')}..."):
+
+            # Get today's injuries
+            espn_date_str = target_date.strftime('%Y%m%d')
+            injuries_today = get_nba_injuries_espn(espn_date_str)
             
             # API Call
             date_str = target_date.strftime('%Y-%m-%d')
             try:
-                board = scoreboardv2.ScoreboardV2(game_date=date_str, day_offset=0)
-                df_games = board.game_header.get_data_frame()
-                line_score = board.line_score.get_data_frame()
+                board = scoreboardv3.ScoreboardV3(game_date=date_str)
+                dfs = board.get_data_frames()
             except Exception as e:
                 st.error(f"ERROR connecting to the NBA API: {e}")
                 st.stop()
-            
-            if df_games.empty:
+
+            if len(dfs) < 2 or dfs[1].empty:
                 st.warning("No games found for this date.")
             else:
-                df_games = df_games.drop_duplicates(subset=['GAME_ID'])
+                df_header = dfs[1].drop_duplicates(subset=['gameId'])
 
-                # Order by time
-                if 'GAME_SEQUENCE' in df_games.columns:
-                    df_games = df_games.sort_values(by='GAME_SEQUENCE')
+                games_list = []
+                for _, g in df_header.iterrows():
+                    game_code = str(g.get('gameCode', ''))
+                    matchup_str = game_code.split('/')[-1]
+                    if len(matchup_str) == 6:
+                        away_abbr = matchup_str[:3]
+                        home_abbr = matchup_str[3:]
+                    else:
+                        continue
 
-                line_score = line_score.drop_duplicates(subset=['GAME_ID', 'TEAM_ID'])
+                    home_id = id_map.get(home_abbr)
+                    away_id = id_map.get(away_abbr)
 
-                # Merge to get team abbreviations
-                df_games = pd.merge(df_games, line_score[['GAME_ID', 'TEAM_ID', 'TEAM_ABBREVIATION']], 
-                                    left_on=['GAME_ID', 'HOME_TEAM_ID'], right_on=['GAME_ID', 'TEAM_ID'], how='left')
-                df_games.rename(columns={'TEAM_ABBREVIATION': 'HOME_TEAM_ABBREVIATION'}, inplace=True)
-                df_games.drop(columns=['TEAM_ID'], inplace=True)
-                
-                df_games = pd.merge(df_games, line_score[['GAME_ID', 'TEAM_ID', 'TEAM_ABBREVIATION']], 
-                                    left_on=['GAME_ID', 'VISITOR_TEAM_ID'], right_on=['GAME_ID', 'TEAM_ID'], how='left')
-                df_games.rename(columns={'TEAM_ABBREVIATION': 'AWAY_TEAM_ABBREVIATION'}, inplace=True)
-                df_games.drop(columns=['TEAM_ID'], inplace=True)
-                
-                # Map IDs
-                df_games['HOME_TEAM_ID'] = df_games['HOME_TEAM_ABBREVIATION'].map(id_map)
-                df_games['AWAY_TEAM_ID'] = df_games['AWAY_TEAM_ABBREVIATION'].map(id_map)
-                df_games = df_games.dropna(subset=['HOME_TEAM_ID', 'AWAY_TEAM_ID'])
-                
+                    if home_id and away_id:
+                        games_list.append({
+                            'GAME_ID': g['gameId'],
+                            'HOME_TEAM_ABBREVIATION': home_abbr,
+                            'AWAY_TEAM_ABBREVIATION': away_abbr,
+                            'HOME_TEAM_ID': int(home_id),
+                            'AWAY_TEAM_ID': int(away_id),
+                            'GAME_DATE': pd.to_datetime(target_date),
+                            'GAME_STATUS_TEXT': g.get('gameStatusText', 'Scheduled')
+                        })
+
+                df_games = pd.DataFrame(games_list)
+
                 if df_games.empty:
                     st.error("ERROR: Could not map teams (IDs not found).")
                     st.stop()
-                    
-                df_games['HOME_TEAM_ID'] = df_games['HOME_TEAM_ID'].astype(int)
-                df_games['AWAY_TEAM_ID'] = df_games['AWAY_TEAM_ID'].astype(int)
-                df_games['GAME_DATE'] = pd.to_datetime(df_games['GAME_DATE_EST'])
                 
                 # Build features for each game
                 pred_rows = []
                 valid_indices = []
+                games_injury_meta = []
                 
                 for idx, row in df_games.iterrows():
-                    feat = build_feature_row(row, df_history)
+                    feat, meta = build_feature_row(
+                        row, 
+                        df_history, 
+                        current_elos, 
+                        team_elo_histories, 
+                        injuries_today, 
+                        df_player_impact
+                    )
                     if feat:
                         pred_rows.append(feat)
                         valid_indices.append(idx)
-                
+                        games_injury_meta.append(meta)
+
                 if pred_rows:
                     X_pred = pd.DataFrame(pred_rows)
                     
@@ -398,6 +580,8 @@ with stylable_container(
                         home = orig_row['HOME_TEAM_ABBREVIATION']
                         away = orig_row['AWAY_TEAM_ABBREVIATION']
                         game_time = orig_row['GAME_STATUS_TEXT']
+
+                        meta = games_injury_meta[i]
                         
                         prob_away = 1 - prob_home
                         winner = home if prob_home > 0.5 else away
@@ -422,13 +606,28 @@ with stylable_container(
                             c1, c2, c3, c4 = st.columns([1.5, 2, 1.5, 1])
                             with c1:
                                 st.markdown(get_team_card(away, "Visitor", align="center"), unsafe_allow_html=True)
+                                away_inj_badge = get_injury_badge_html(meta['away_penalty'], meta['away_players'])
+                                if away_inj_badge:
+                                    st.markdown(away_inj_badge, unsafe_allow_html=True)
                             with c2:
-                                st.markdown(f"<div style='text-align: center; width: 100%; margin-bottom: 5px;'><span style='font-weight: bold; color: #white; background: #262730; border-radius: 4px; padding: 2px 10px; font-size: 12px;'>{game_time}</span></div>", unsafe_allow_html=True)
-                                st.markdown(f"<div style='text-align: center; width: 100%;'>", unsafe_allow_html=True)
+                                st.markdown(
+                                    f"<div style='text-align: center; width: 100%; margin-bottom: 5px;'>"
+                                    f"<span style='font-weight: bold; color: white; background: #262730; border-radius: 4px; padding: 2px 10px; font-size: 12px;'>"
+                                    f"{game_time}</span></div>", 
+                                    unsafe_allow_html=True
+                                )
+                                st.markdown("<div style='text-align: center; width: 100%;'>", unsafe_allow_html=True)
                                 st.progress(float(prob_away))
-                                st.markdown(f"</div><div style='text-align: center; color: #888; font-size: 13px;'>{prob_away:.1%} vs {prob_home:.1%}</div>", unsafe_allow_html=True)
+                                st.markdown(
+                                    f"</div><div style='text-align: center; color: #888; font-size: 13px; margin-top: 2px;'>"
+                                    f"{prob_away:.1%} vs {prob_home:.1%}</div>", 
+                                    unsafe_allow_html=True
+                                )
                             with c3:
                                 st.markdown(get_team_card(home, "Home", align="center"), unsafe_allow_html=True)
+                                home_inj_badge = get_injury_badge_html(meta['home_penalty'], meta['home_players'])
+                                if home_inj_badge:
+                                    st.markdown(home_inj_badge, unsafe_allow_html=True)
                             with c4:
                                 st.markdown(
                                     f"""
@@ -441,20 +640,26 @@ with stylable_container(
                                     unsafe_allow_html=True
                                 )
                             
-                            st.markdown('</div>', unsafe_allow_html=True)
-                            st.markdown('<div style="height: 1px; background-color: #333; width: 100%;"></div>', unsafe_allow_html=True)
+                            st.markdown('<div style="height: 1px; background-color: #333; width: 100%; margin: 12px 0;"></div>', unsafe_allow_html=True)
                     
                     # Detailed table
                     with st.expander("View Detailed Table"):
                         resumo = pd.DataFrame({
-                            'Home Team': df_games.loc[valid_indices, 'HOME_TEAM_ABBREVIATION'],
                             'Away Team': df_games.loc[valid_indices, 'AWAY_TEAM_ABBREVIATION'],
+                            'Away Injury Penalty': [f"-{m['away_penalty']:.1f} ELO" if m['away_penalty'] > 0 else "None" for m in games_injury_meta],
+                            'Away Prob': 1 - probs,
+                            'Home Team': df_games.loc[valid_indices, 'HOME_TEAM_ABBREVIATION'],
+                            'Home Injury Penalty': [f"-{m['home_penalty']:.1f} ELO" if m['home_penalty'] > 0 else "None" for m in games_injury_meta],
                             'Home Prob': probs,
-                            'Away Prob': 1-probs,
-                            'Confidence': [max(p, 1-p) for p in probs]
+                            'Confidence': [max(p, 1 - p) for p in probs]
                         })
-                        st.dataframe(resumo.style.format({'Home Prob': '{:.1%}', 'Away Prob': '{:.1%}', 'Confidence': '{:.1%}'})
-                                    .background_gradient(subset=['Confidence'], cmap='Greens'))
+                        st.dataframe(
+                            resumo.style.format({
+                                'Away Prob': '{:.1%}', 
+                                'Home Prob': '{:.1%}', 
+                                'Confidence': '{:.1%}'
+                            }).background_gradient(subset=['Confidence'], cmap='Greens')
+                        )
                         
                 else:
                     st.warning("It was not possible to build features for any game (missing historical data).")
